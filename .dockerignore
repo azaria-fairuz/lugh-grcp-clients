@@ -1,0 +1,26 @@
+# Jupyter checkpoints
+**/.ipynb_checkpoints/
+
+# Python cache
+**/__pycache__/
+
+# Temp + local envs
+temp/
+venv/
+.env
+
+# Git
+.git
+.gitignore
+
+# Python
+*.pyc
+*.pyo
+*.pyd
+
+# OS files
+.DS_Store
+
+# Docker-specific
+Dockerfile
+docker-compose.yml
