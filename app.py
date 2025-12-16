@@ -2,19 +2,25 @@ import os
 import io
 import cv2
 import grpc
+import secrets
 import threading
 import frame_pb2
 import frame_pb2_grpc
 
-from pony.orm import db_session, select, Database
-from models import db, GaugeCalibration, GaugeType, CctvConnection
+from jose import jwt, JWTError
+from datetime import datetime, timedelta
+from pony.orm import db_session, commit, select
+from models import db, GaugeCalibration, GaugeType, CctvConnection, User
 
 from PIL import Image
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Any, Optional
 from fastapi.responses import JSONResponse
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends
+from fastapi import APIRouter, Depends
+
+load_dotenv(override=True)
 
 db_file = "db.sqlite"
 db_exists = os.path.exists(db_file)
@@ -22,16 +28,27 @@ db_exists = os.path.exists(db_file)
 db.bind(provider='sqlite', filename=db_file, create_db=not db_exists)
 db.generate_mapping(create_tables=True)
 
-load_dotenv(override=True)
+@db_session
+def seed_users():
+    users = [
+        {"name": "admin", "email": "admin@admin.com", "password": "adminadmin"},
+        {"name": "adminpdu", "email": "adminpdu@admin.com", "password": "adminadmin"},
+    ]
 
-WITS_IP         = os.getenv("WITS_IP", 8504)
-WITS_PORT       = os.getenv("WITS_PORT", "127.0.0.1")
-GRPC_ADDRESS    = os.getenv("GRPC_ADDRESS", 8502)
+    for u in users:
+        if not User.exists(email=u["email"]):
+            db_user = User(name=u["name"],email=u["email"],password=u["password"])
+            db_user.set_password(u["password"])
 
-app = FastAPI()
-threads = {}
-running_streams = {}
-wits0_connection = False
+    print("[RTSP] Users seeded successfully!")
+
+WITS_IP      = os.getenv("WITS_IP", 8504)
+WITS_PORT    = os.getenv("WITS_PORT", "127.0.0.1")
+GRPC_ADDRESS = os.getenv("GRPC_ADDRESS", 8502)
+SECRET_KEY   = os.getenv("JWT_SECREET", "j192y9e7127")
+ALGORITHM    = os.getenv("JWT_ALGORITHM", "HS256")
+
+ACCESS_TOKEN_EXPIRE_MINUTES = os.getenv("JWT_EXPIRE_IN_MINUTE", 60)
 
 class ConnectRequest(BaseModel):
     camera_id  : str
@@ -52,6 +69,10 @@ class CalibrationCCTVRequest(BaseModel):
     url      : str
     name     : str
     user     : str
+    password : str
+
+class LoginRequest(BaseModel):
+    email    : str
     password : str
 
 class ResponseAPI(BaseModel):
@@ -107,9 +128,37 @@ def get_response_format(http_code: int, message: str = None, status: str = "succ
         data      = data,
     )
 
+@db_session
+def get_current_user(request: Request):
+    token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        print(token)
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = User.get(id=user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return user
+
+threads = {}
+running_streams = {}
+wits0_connection = False
+
+app = FastAPI()
+router = APIRouter(dependencies=[Depends(get_current_user)], tags=["Protected"])
+
+seed_users()
+
 #-- GRPC endpoints
 
-@app.post("/connect", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.post("/connect", response_model = ResponseAPI, response_model_exclude_none = True)
 def start_camera_connection(req: ConnectRequest):
     camera_id = req.camera_id
     if camera_id in running_streams and running_streams[camera_id] == True:
@@ -128,7 +177,7 @@ def start_camera_connection(req: ConnectRequest):
 
     return get_response_format(200)
 
-@app.post("/disconnect/{camera_id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.post("/disconnect/{camera_id}", response_model = ResponseAPI, response_model_exclude_none = True)
 def stop_camera_connection(camera_id: str):
     if camera_id not in running_streams:
         message  = f"connection with camera id of {camera_id} does not exist"
@@ -140,7 +189,7 @@ def stop_camera_connection(camera_id: str):
 
     return get_response_format(200)
 
-@app.get("/status", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.get("/status", response_model = ResponseAPI, response_model_exclude_none = True)
 def stop_camera_connection():
     connection = [cam for cam, active in running_streams.items() if active]
     response   = get_response_format(200, data = connection)
@@ -149,7 +198,7 @@ def stop_camera_connection():
 
 #-- CALIBRATION endpoints
 
-@app.get("/calibration", response_model=ResponseAPI, response_model_exclude_none=True)
+@router.get("/calibration", response_model=ResponseAPI, response_model_exclude_none=True)
 @db_session
 def get_calibration(gauge_type: int = None, cctv_connection: int = None, page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100)):
     query = select(cal for cal in GaugeCalibration)
@@ -186,7 +235,7 @@ def get_calibration(gauge_type: int = None, cctv_connection: int = None, page: i
 
     return response
 
-@app.get("/calibration/cctv", response_model=ResponseAPI, response_model_exclude_none=True)
+@router.get("/calibration/cctv", response_model=ResponseAPI, response_model_exclude_none=True)
 @db_session
 def get_calibration_cctv(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100)):
     query = CctvConnection.select()
@@ -208,7 +257,7 @@ def get_calibration_cctv(page: int = Query(1, ge=1), page_size: int = Query(10, 
 
     return response
 
-@app.get("/calibration/type", response_model=ResponseAPI, response_model_exclude_none=True)
+@router.get("/calibration/type", response_model=ResponseAPI, response_model_exclude_none=True)
 @db_session
 def get_calibration_type(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100)):
     query = GaugeType.select()
@@ -231,7 +280,7 @@ def get_calibration_type(page: int = Query(1, ge=1), page_size: int = Query(10, 
     
     return response
 
-@app.post("/calibration", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.post("/calibration", response_model = ResponseAPI, response_model_exclude_none = True)
 @db_session
 def store_calibration(req: CalibrationRequest):
     query    = GaugeCalibration(gauge_type = req.gauge_type, cctv_connection = req.cctv_connection)
@@ -239,7 +288,7 @@ def store_calibration(req: CalibrationRequest):
 
     return response
 
-@app.post("/calibration/cctv", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.post("/calibration/cctv", response_model = ResponseAPI, response_model_exclude_none = True)
 @db_session
 def store_calibration_cctv(req: CalibrationCCTVRequest):
     query = CctvConnection(
@@ -258,7 +307,7 @@ def store_calibration_cctv(req: CalibrationCCTVRequest):
 
     return response
 
-@app.post("/calibration/type", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.post("/calibration/type", response_model = ResponseAPI, response_model_exclude_none = True)
 @db_session
 def store_calibration_type(req: CalibrationTypeRequest):
     query = GaugeType(
@@ -279,7 +328,7 @@ def store_calibration_type(req: CalibrationTypeRequest):
 
     return response
 
-@app.put("/calibration/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.put("/calibration/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
 @db_session
 def update_calibration(id: int, req: CalibrationRequest):
     query = GaugeCalibration.get(id=id)
@@ -300,7 +349,7 @@ def update_calibration(id: int, req: CalibrationRequest):
 
     return response
 
-@app.put("/calibration/type/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.put("/calibration/type/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
 @db_session
 def update_calibration_type(id: int, req: CalibrationTypeRequest):
     query = GaugeType.get(id=id)
@@ -330,41 +379,78 @@ def update_calibration_type(id: int, req: CalibrationTypeRequest):
 
     return response
 
-@app.delete("/calibration/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.delete("/calibration/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
 @db_session
 def delete_calibration(id: int):
-    item = GaugeCalibration.get(id = id)
-    if not item:
+    query = GaugeCalibration.get(id = id)
+    if not query:
         raise HTTPException(status_code=404, detail="Item not found")
     
-    item.delete()
+    query.delete()
 
     response = get_response_format(200, message = f"calibration with id of {id} has been deleted")
 
     return response 
 
-@app.delete("/calibration/type/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.delete("/calibration/type/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
 @db_session
 def delete_calibration_type(id: int):
-    item = GaugeType.get(id = id)
-    if not item:
+    query = GaugeType.get(id = id)
+    if not query:
         raise HTTPException(status_code=404, detail="Item not found")
     
-    item.delete()
-
+    query.delete()
     response = get_response_format(200, message = f"calibration type with id of {id} has been deleted")
 
     return response 
 
-@app.delete("/calibration/cctv/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@router.delete("/calibration/cctv/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
 @db_session
 def delete_calibration_cctv(id: int):
-    item = CctvConnection.get(id = id)
-    if not item:
+    query = CctvConnection.get(id = id)
+    if not query:
         raise HTTPException(status_code=404, detail="Item not found")
     
-    item.delete()
-
+    query.delete()
     response = get_response_format(200, message = f"CCTV data with id of {id} has been deleted")
 
     return response 
+
+#-- AUTH endpoints
+
+@app.post("/auth/login", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def login(response: Response, req: LoginRequest):
+    user = User.get(email=req.email)
+    if not user or not user.verify_password(req.password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token_data = {"sub": str(user.id), "exp": expire}
+    token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
+
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        secure=False  # change to True in HTTPS
+    )
+
+    response = get_response_format(200, data = token, message = f"Logged in successfully")
+
+    return response
+
+@router.post("/auth/logout", response_model = ResponseAPI, response_model_exclude_none = True)
+def logout(response: Response):
+    response.delete_cookie(
+        key="access_token",
+        httponly=True,
+        secure=False  # change to True in HTTPS
+    )
+    
+    response = get_response_format(200, message = f"Logged out successfully")
+
+    return response
+
+app.include_router(router)
