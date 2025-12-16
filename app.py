@@ -6,27 +6,53 @@ import threading
 import frame_pb2
 import frame_pb2_grpc
 
-import numpy as np
+from pony.orm import db_session, select, Database
+from models import db, GaugeCalibration, GaugeType, CctvConnection
 
 from PIL import Image
-from fastapi import FastAPI
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Any, Optional
 from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query
+
+db_file = "db.sqlite"
+db_exists = os.path.exists(db_file)
+
+db.bind(provider='sqlite', filename=db_file, create_db=not db_exists)
+db.generate_mapping(create_tables=True)
 
 load_dotenv(override=True)
 
-GRPC_ADDRESS = os.getenv("GRPC_ADDRESS")
+WITS_IP         = os.getenv("WITS_IP", 8504)
+WITS_PORT       = os.getenv("WITS_PORT", "127.0.0.1")
+GRPC_ADDRESS    = os.getenv("GRPC_ADDRESS", 8502)
 
 app = FastAPI()
-
 threads = {}
 running_streams = {}
+wits0_connection = False
 
 class ConnectRequest(BaseModel):
     camera_id  : str
     rtsp_url   : str
+
+class CalibrationRequest(BaseModel):
+    gauge_type      : int
+    cctv_connection : int
+
+class CalibrationTypeRequest(BaseModel):
+    max_value    : int
+    min_value    : int
+    start_degree : int
+    end_degree   : int
+    needle_type  : str
+
+class CalibrationCCTVRequest(BaseModel):
+    url      : str
+    name     : str
+    user     : str
+    password : str
 
 class ResponseAPI(BaseModel):
     status      : str
@@ -81,6 +107,8 @@ def get_response_format(http_code: int, message: str = None, status: str = "succ
         data      = data,
     )
 
+#-- GRPC endpoints
+
 @app.post("/connect", response_model = ResponseAPI, response_model_exclude_none = True)
 def start_camera_connection(req: ConnectRequest):
     camera_id = req.camera_id
@@ -118,3 +146,225 @@ def stop_camera_connection():
     response   = get_response_format(200, data = connection)
 
     return response
+
+#-- CALIBRATION endpoints
+
+@app.get("/calibration", response_model=ResponseAPI, response_model_exclude_none=True)
+@db_session
+def get_calibration(gauge_type: int = None, cctv_connection: int = None, page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100)):
+    query = select(cal for cal in GaugeCalibration)
+
+    if gauge_type is not None:
+        query = query.filter(lambda cal: cal.gauge_type.id == gauge_type)
+    if cctv_connection is not None:
+        query = query.filter(lambda cal: cal.cctv_connection.id == cctv_connection)
+
+    start = (page - 1) * page_size
+    end   = start + page_size
+    data  = [
+        {
+            "id": cal.id,
+            "gauge_type": {
+                "max_value": cal.gauge_type.max_value,
+                "min_value": cal.gauge_type.min_value,
+                "start_degree": cal.gauge_type.start_degree,
+                "end_degree": cal.gauge_type.end_degree,
+                "needle_type": cal.gauge_type.needle_type
+            },
+            "cctv_connection": {
+                "url": cal.cctv_connection.url,
+                "name": cal.cctv_connection.name,
+                "user": cal.cctv_connection.user,
+                "password": cal.cctv_connection.password
+            }
+        }
+        for cal in query[start:end]
+    ]
+
+    total    = query.count() if hasattr(query, "count") else len(query)
+    response = get_response_format(200, data = {"data" : data, "page": page, "page_size": page_size, "total": total})
+
+    return response
+
+@app.get("/calibration/cctv", response_model=ResponseAPI, response_model_exclude_none=True)
+@db_session
+def get_calibration_cctv(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100)):
+    query = CctvConnection.select()
+    start = (page - 1) * page_size
+    end   = start + page_size
+    data  = [
+        {
+            "id"       : cal.id,
+            "url"      : cal.url,
+            "name"     : cal.name,
+            "user"     : cal.user,
+            # "password" : cal.password
+        }
+        for cal in query[start:end]
+    ]
+
+    total    = query.count() if hasattr(query, "count") else len(query)
+    response = get_response_format(200, data = {"data" : data, "page": page, "page_size": page_size, "total": total})
+
+    return response
+
+@app.get("/calibration/type", response_model=ResponseAPI, response_model_exclude_none=True)
+@db_session
+def get_calibration_type(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100)):
+    query = GaugeType.select()
+    start = (page - 1) * page_size
+    end   = start + page_size
+    data  = [
+        {
+            "id"           : cal.id,
+            "max_value"    : cal.max_value,
+            "min_value"    : cal.min_value,
+            "start_degree" : cal.start_degree,
+            "end_degree"   : cal.end_degree,
+            "needle_type"  : cal.needle_type
+        }
+        for cal in query[start:end]
+    ]
+
+    total    = query.count() if hasattr(query, "count") else len(query)
+    response = get_response_format(200, data = {"data" : data, "page": page, "page_size": page_size, "total": total})
+    
+    return response
+
+@app.post("/calibration", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def store_calibration(req: CalibrationRequest):
+    query    = GaugeCalibration(gauge_type = req.gauge_type, cctv_connection = req.cctv_connection)
+    response = get_response_format(200, data = {"gauge_type": query.gauge_type.id, "cctv_connection": query.cctv_connection.id})
+
+    return response
+
+@app.post("/calibration/cctv", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def store_calibration_cctv(req: CalibrationCCTVRequest):
+    query = CctvConnection(
+        url      = req.url,
+        name     = req.name,
+        user     = req.user,
+        password = req.password
+    )
+    data = {
+        "url"      : query.url,
+        "name"     : query.name,
+        "user"     : query.user,
+        # "password" : query.password
+    }
+    response = get_response_format(200, data = data)
+
+    return response
+
+@app.post("/calibration/type", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def store_calibration_type(req: CalibrationTypeRequest):
+    query = GaugeType(
+        max_value    = req.max_value, 
+        min_value    = req.min_value, 
+        start_degree = req.start_degree, 
+        end_degree   = req.end_degree, 
+        needle_type  = req.needle_type
+    )
+    data = {
+        "max_value"    : query.max_value, 
+        "min_value"    : query.min_value, 
+        "start_degree" : query.start_degree, 
+        "end_degree"   : query.end_degree, 
+        "needle_type"  : query.needle_type
+    }
+    response = get_response_format(200, data = data)
+
+    return response
+
+@app.put("/calibration/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def update_calibration(id: int, req: CalibrationRequest):
+    query = GaugeCalibration.get(id=id)
+    if not query:
+        raise HTTPException(status_code = 404, detail = "Item not found")
+    
+    if req.gauge_type is not None:
+        query.gauge_type = req.gauge_type
+    if req.cctv_connection is not None:
+        query.cctv_connection = req.cctv_connection
+    
+    data = {
+        "id"              : query.id,
+        "gauge_type"      : query.gauge_type.id, 
+        "cctv_connection" : query.cctv_connection.id
+    }
+    response = get_response_format(200, data = data)
+
+    return response
+
+@app.put("/calibration/type/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def update_calibration_type(id: int, req: CalibrationTypeRequest):
+    query = GaugeType.get(id=id)
+    if not query:
+        raise HTTPException(status_code = 404, detail = "Item not found")
+    
+    if req.max_value is not None:
+        query.max_value = req.max_value
+    if req.min_value is not None:
+        query.min_value = req.min_value
+    if req.start_degree is not None:
+        query.start_degree = req.start_degree
+    if req.end_degree is not None:
+        query.end_degree = req.end_degree
+    if req.needle_type is not None:
+        query.needle_type = req.needle_type
+
+    data = {
+        "id"           : query.id,
+        "max_value"    : query.max_value,
+        "min_value"    : query.min_value,
+        "start_degree" : query.start_degree,
+        "end_degree"   : query.end_degree,
+        "needle_type"  : query.needle_type
+    }
+    response = get_response_format(200, data = data)
+
+    return response
+
+@app.delete("/calibration/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def delete_calibration(id: int):
+    item = GaugeCalibration.get(id = id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    item.delete()
+
+    response = get_response_format(200, message = f"calibration with id of {id} has been deleted")
+
+    return response 
+
+@app.delete("/calibration/type/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def delete_calibration_type(id: int):
+    item = GaugeType.get(id = id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    item.delete()
+
+    response = get_response_format(200, message = f"calibration type with id of {id} has been deleted")
+
+    return response 
+
+@app.delete("/calibration/cctv/{id}", response_model = ResponseAPI, response_model_exclude_none = True)
+@db_session
+def delete_calibration_cctv(id: int):
+    item = CctvConnection.get(id = id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    item.delete()
+
+    response = get_response_format(200, message = f"CCTV data with id of {id} has been deleted")
+
+    return response 
