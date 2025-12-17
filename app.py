@@ -44,7 +44,7 @@ def seed_users():
 
 WITS_IP      = os.getenv("WITS_IP", 8504)
 WITS_PORT    = os.getenv("WITS_PORT", "127.0.0.1")
-GRPC_ADDRESS = os.getenv("GRPC_ADDRESS", 8502)
+GRPC_ADDRESS = os.getenv("GRPC_ADDRESS", 8501)
 SECRET_KEY   = os.getenv("JWT_SECREET", "j192y9e7127")
 ALGORITHM    = os.getenv("JWT_ALGORITHM", "HS256")
 
