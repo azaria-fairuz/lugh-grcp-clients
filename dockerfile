@@ -18,6 +18,6 @@ COPY --from=builder /install/packages /usr/local
 COPY . .
 COPY ./.env.example ./.env
 
-EXPOSE 8501
+EXPOSE 8500
 
-CMD ["fastapi", "run", "app.py", "--port=8501"]
+CMD ["fastapi", "run", "app.py", "--port=8500"]
